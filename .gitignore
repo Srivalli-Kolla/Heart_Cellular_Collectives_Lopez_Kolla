@@ -164,3 +164,8 @@ cython_debug/
 *data
 *.png
 *.svg
+*.tsv
+*.csv
+*.sqlite
+*.h5ad
+*hubmap
