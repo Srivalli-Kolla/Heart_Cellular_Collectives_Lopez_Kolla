@@ -46,6 +46,7 @@ ASSAY_PARAMS = {
 LOG_FILE = LOG_DIR / "Data-Litnukova_Kanemaru.log"
 logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# Function to download fastqs
 def download_fastq(run_id, ftp_links):
     """Download FASTQ files using axel."""
     output_dir = DOWNLOAD_DIR / run_id
@@ -60,6 +61,7 @@ def download_fastq(run_id, ftp_links):
         except subprocess.CalledProcessError as e:
             logging.error(f"Failed to download {link} for {run_id}: {e}")
 
+# Function to run STAR alignmnet
 def run_star(run_id, assay):
     """Run STAR for mapping based on the assay type."""
     fastq_dir = DOWNLOAD_DIR / run_id
@@ -108,9 +110,13 @@ def run_star(run_id, assay):
     except subprocess.CalledProcessError as e:
         logging.error(f"STAR mapping failed for {run_id} with error: {e}")
 
+# Function to convert STAR outout to h5ad
 def convert_to_h5ad(run_id):
     """Convert STAR output to H5AD format."""
-    matrix_dir = MAPPED_DIR / run_id / "output" / "Solo.out" / "GeneFull" / "raw"
+    
+    matrix_dir = MAPPED_DIR / run_id / "outputSolo.out" / "GeneFull" / "raw"
+    logging.info(f"Checking matrix directory: {matrix_dir}")
+    
     if not matrix_dir.exists():
         logging.error(f"Matrix directory does not exist for {run_id}: {matrix_dir}")
         return
@@ -119,54 +125,107 @@ def convert_to_h5ad(run_id):
     barcodes_file = matrix_dir / "barcodes.tsv"
     features_file = matrix_dir / "features.tsv"
 
-    if not (matrix_file.exists() and barcodes_file.exists() and features_file.exists()):
-        logging.error(f"Required files are missing in {matrix_dir} for {run_id}.")
+    if not matrix_file.exists():
+        logging.error(f"Matrix file missing for {run_id}: {matrix_file}")
+        return
+    if not barcodes_file.exists():
+        logging.error(f"Barcodes file missing for {run_id}: {barcodes_file}")
+        return
+    if not features_file.exists():
+        logging.error(f"Features file missing for {run_id}: {features_file}")
         return
 
     try:
-        # Load matrix and ensure sparse format
+       
         mtx = scipy.io.mmread(matrix_file).tocsc()
 
-        # Load barcodes and features
+       
         barcodes = pd.read_csv(barcodes_file, header=None, sep="\t")[0].values
         features = pd.read_csv(features_file, header=None, sep="\t")[1].values
 
-        # Create AnnData object
+        if mtx.shape[0] != len(features) or mtx.shape[1] != len(barcodes):
+            logging.error(f"Matrix dimensions {mtx.shape} do not match the lengths of barcodes {len(barcodes)} or features {len(features)}.")
+            return
+
+    
         adata = anndata.AnnData(X=mtx, obs=pd.DataFrame(index=barcodes), var=pd.DataFrame(index=features))
 
-        # Write to H5AD format
+        
         output_path = H5AD_DIR / f"{run_id}.h5ad"
+
+        
         adata.write(output_path)
         logging.info(f"Converted STAR output to H5AD format for {run_id} at {output_path}")
     except Exception as e:
         logging.error(f"Failed to convert to H5AD for {run_id} with error: {e}")
 
+# Function to run all necessary steps
 def process_run(run_id, assay, ftp_links):
-    download_fastq(run_id, ftp_links)
-    run_star(run_id, assay)
-    convert_to_h5ad(run_id)
+    try:
+        # Define paths
+        h5ad_path = H5AD_DIR / f"{run_id}.h5ad"
+        matrix_dir = MAPPED_DIR / run_id / "outputSolo.out" / "GeneFull" / "raw"
+        fastq_dir = DOWNLOAD_DIR / run_id
+        
+        # Check if STAR output exists and convert to H5AD if found
+        if matrix_dir.exists():
+            logging.info(f"STAR output found for {run_id}. Converting to H5AD.")
+            convert_to_h5ad(run_id)
+            return
+        
+        # Check for existing FASTQ files
+        fastq_files_r1 = list(fastq_dir.glob("*_R1_*.fastq.gz"))
+        fastq_files_r2 = list(fastq_dir.glob("*_R2_*.fastq.gz"))
 
+        if fastq_files_r1 and fastq_files_r2:
+            logging.info(f"FASTQ files found for {run_id}. Running STAR alignment.")
+            run_star(run_id, assay)
+
+            # Ensure STAR alignment was successful
+            if matrix_dir.exists():  # Only convert if STAR has generated output
+                convert_to_h5ad(run_id)
+            else:
+                logging.error(f"STAR output was not generated for {run_id} after alignment.")
+            return
+
+        # If no files are found, download FASTQ files
+        logging.info(f"No files found for {run_id}. Downloading FASTQ files.")
+        download_fastq(run_id, ftp_links)
+        
+        # Run STAR and convert to H5AD after downloading
+        run_star(run_id, assay)
+
+        # Check STAR output again after attempting to run
+        if matrix_dir.exists():
+            convert_to_h5ad(run_id)
+        else:
+            logging.error(f"STAR output was not generated for {run_id} after alignment.")
+
+    except Exception as e:
+        logging.error(f"Error processing {run_id} during conversion: {e}")
+
+# Function to perform tasks
 def main():
-    # Ensure necessary directories exist
+    
     MAPPED_DIR.mkdir(parents=True, exist_ok=True)
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     H5AD_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Load metadata and FTP links
+    
     metadata = pd.read_csv(METADATA_FILE, sep="\t")
     ftp_links = pd.read_csv(FTP_LINKS_FILE, sep="\t")
 
-    # Convert FTP links to a dictionary for quick access by Run ID
+    
     ftp_links_dict = ftp_links.set_index('Run')['submitted_ftp'].to_dict()
 
-    # Loop through each unique Run ID in metadata
+    
     for run_id in metadata['Run'].unique():
         try:
-            # Retrieve assay type for the current run
+            
             assay = metadata.loc[metadata['Run'] == run_id, 'Assay'].values[0]
 
-            # Retrieve FTP links for the current run
+            
             ftp_links_for_run = ftp_links_dict.get(run_id)
             if not ftp_links_for_run:
                 logging.warning(f"No FTP links found for run ID {run_id}. Skipping.")
