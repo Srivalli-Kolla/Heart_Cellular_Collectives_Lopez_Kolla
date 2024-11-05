@@ -7,6 +7,7 @@ import scipy.io
 import numpy as np
 from pathlib import Path
 import logging
+import signal
 
 # Define paths
 BASE_DIR = Path("/mnt/LaCIE/skolla")
@@ -20,6 +21,11 @@ STAR_PATH = "/usr/local/bin/STAR"
 STAR_INDEX = BASE_DIR / "dmd_dc_skeletal/index_files/human/"
 METADATA_FILE = BASE_DIR / "Github/Heart_Cellular_Collectives_Lopez_Kolla/ncbi_sra/data/Data-D3_litnukova.tsv"
 FTP_LINKS_FILE = BASE_DIR / "Github/Heart_Cellular_Collectives_Lopez_Kolla/ncbi_sra/data/Data-D3_litnukova-links.tsv"
+
+# Configure logging
+LOG_FILE = LOG_DIR / "Data-D3_litnukova.log"
+logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 
 # Define whitelist mapping for assay types
 WHITELIST_MAPPING = {
@@ -43,9 +49,18 @@ ASSAY_PARAMS = {
     "Single Cell Multiome v1": {"cb_len": 16, "umi_len": 12, "strand": "Forward"},
 }
 
-# Configure logging
-LOG_FILE = LOG_DIR / "Data-D3_litnukova.log"
-logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Function to handle subprocess calls and SIGPIPE
+def safe_subprocess(command, log_message="Running command"):
+    try:
+        logging.info(log_message)
+        result = subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, preexec_fn=os.setpgrp)
+        return result
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Command failed with error: {e.stderr.decode()}")
+        return None
+    except BrokenPipeError:
+        logging.error("Broken pipe error (SIGPIPE) occurred in subprocess.")
+        return None
 
 # Function to download FASTQ files
 def download_fastqs(run_id, ftp_links):
@@ -53,30 +68,46 @@ def download_fastqs(run_id, ftp_links):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     for link in ftp_links.split(';'):
-        link = link.strip()  # Clean any extra whitespace
         try:
+            # Add ftp:// prefix if not present
+            if not link.startswith('ftp://'):
+                link = 'ftp://' + link.strip()
+            
             logging.info(f"Downloading {link} for {run_id}...")
             output_file = output_dir / Path(link).name
             
-            # Use axel to download with multiple connections
+            # Skip if file already exists and has size > 0
+            if output_file.exists() and output_file.stat().st_size > 0:
+                logging.info(f"File {output_file} already exists, skipping download...")
+                continue
+                
+            # Try axel first
             axel_command = ['axel', '-n', '8', '-o', str(output_file), link]
-            subprocess.run(axel_command, check=True)
-            logging.info(f"Successfully downloaded {link} for {run_id}.")
-        except subprocess.CalledProcessError as e:
-            logging.error(f"Failed to download {link} for {run_id}: {e}. Retrying...")
-            try:
-                subprocess.run(axel_command, check=True)
-                logging.info(f"Successfully downloaded {link} for {run_id} on retry.")
-            except subprocess.CalledProcessError as retry_e:
-                logging.error(f"Retry failed for {link} for {run_id}: {retry_e}")
-        except Exception as general_e:
-            logging.error(f"An unexpected error occurred for {link} for {run_id}: {general_e}")
+            axel_result = safe_subprocess(axel_command, f"Downloading with axel: {link}")
+            
+            # If axel fails, try wget as fallback
+            if not axel_result:
+                logging.info(f"Axel failed, trying wget for {link}...")
+                wget_command = ['wget', '-O', str(output_file), link]
+                wget_result = safe_subprocess(wget_command, f"Downloading with wget: {link}")
+                
+                if not wget_result:
+                    logging.error(f"Both axel and wget failed to download {link}")
+                    continue
+            
+            if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
+                logging.info(f"Successfully downloaded {link} for {run_id}")
+            else:
+                logging.error(f"Download appeared to succeed but file is empty or missing: {output_file}")
+                
+        except Exception as e:
+            logging.error(f"Error downloading {link} for {run_id}: {str(e)}")
+
 
 # Function to run STAR mapping
 def run_star(run_id, assay):
     fastq_dir = DOWNLOAD_DIR / run_id
     fastq_files = sorted(fastq_dir.glob("*.fastq.gz"))
-
     fastq_files_r1 = [file for file in fastq_files if "_R1_" in file.name]
     fastq_files_r2 = [file for file in fastq_files if "_R2_" in file.name]
 
@@ -85,17 +116,9 @@ def run_star(run_id, assay):
         return False
 
     assay_params = ASSAY_PARAMS.get(assay)
-    if not assay_params:
-        logging.error(f"No STAR parameters available for assay {assay}")
-        return False
-
     output_dir = MAPPED_DIR / run_id / "output"
-    output_dir.mkdir(parents=True, exist_ok=True)  
-
+    output_dir.mkdir(parents=True, exist_ok=True)
     whitelist_filename = WHITELIST_MAPPING.get(assay)
-    if not whitelist_filename:
-        logging.error(f"No whitelist file found for assay type {assay}")
-        return False
 
     star_command = [
         STAR_PATH, "--runThreadN", "32",
@@ -114,13 +137,8 @@ def run_star(run_id, assay):
         "--outFileNamePrefix", str(output_dir / "")
     ]
 
-    try:
-        subprocess.run(star_command, check=True)
-        logging.info(f"STAR mapping completed for {run_id}.")
-        return True
-    except subprocess.CalledProcessError as e:
-        logging.error(f"STAR mapping failed for {run_id} with error: {e}")
-        return False
+
+    return bool(safe_subprocess(star_command, f"Running STAR mapping for {run_id}"))
     
 # Function to convert STAR output to H5AD
 def convert_star_to_h5ad(run_accession):
@@ -140,11 +158,11 @@ def convert_star_to_h5ad(run_accession):
 
     try:
         logging.info(f"Converting STAR output to H5AD for {run_accession}...")
-        barcodes = pd.read_csv(barcodes_file, header=None)
-        features = pd.read_csv(features_file, header=None, sep='\t', names=['gene_id', 'gene_name'])
-        matrix = scipy.io.mmread(matrix_file).tocsr()
+        barcodes = pd.read_csv(barcodes_file, header=None, index_col= 0)
+        features = pd.read_csv(features_file, sep='\t', names=['gene_ids', 'gene_names', 'gene_types'], index_col=1)
+        matrix = scipy.sparse.csr_matrix(scipy.io.mmread( matrix_file).T)
 
-        adata = anndata.AnnData(X=matrix.T, obs=pd.DataFrame(index=barcodes[0]), var=features.set_index('gene_id'))
+        adata = anndata.AnnData(X=matrix, obs=barcodes, var=features)
         adata.write(h5ad_file)
         logging.info(f"Successfully converted to H5AD: {h5ad_file}")
 
@@ -179,29 +197,118 @@ def process_run(run_info):
     # Set up logging for this run
     run_logger = setup_run_logger(run_accession)
 
-    # Download FASTQ files
-    download_fastqs(run_accession, run_info['submitted_ftp'])
+    # Define expected STAR output file path
+    star_output_dir = MAPPED_DIR / run_accession / "outputSolo.out" / "GeneFull" / "raw"
+    expected_star_file = os.path.join(star_output_dir, "barcodes.tsv") 
 
-    # Map with STAR
-    assay = run_info['Assay']
-    if run_star(run_accession, assay):
-        # Convert to H5AD if STAR mapping was successful
-        convert_star_to_h5ad(run_accession)
+    if os.path.exists(expected_star_file):
+        logging.info(f"STAR output file found for {run_accession}, skipping download and mapping.")
+    else:
+        # Download FASTQ files
+        download_fastqs(run_accession, run_info['submitted_ftp'])
+
+        # Map with STAR
+        assay = run_info['Assay']
+        if run_star(run_accession, assay):
+            logging.info(f"STAR mapping completed for {run_accession}")
+        else:
+            logging.warning(f"STAR mapping failed for {run_accession}")
+        
+    # Convert to H5AD if STAR output exists (or was successfully created)
+    convert_star_to_h5ad(run_accession)
 
 def main():
     try:
         # Read metadata and submitted_ftp
         metadata = pd.read_csv(METADATA_FILE, sep="\t")
         ftp_links = pd.read_csv(FTP_LINKS_FILE, sep="\t")
+        
+        # Add diagnostic logging for input data
+        logging.info(f"Total rows in metadata: {len(metadata)}")
+        logging.info(f"Total rows in ftp_links: {len(ftp_links)}")
+        
+        # Check for any missing or null values in key columns
+        logging.info(f"Null values in metadata 'Run' column: {metadata['Run'].isnull().sum()}")
+        logging.info(f"Null values in ftp_links 'Run' column: {ftp_links['Run'].isnull().sum()}")
 
         # Merge metadata with submitted_ftp on run accession
         merged_info = pd.merge(metadata, ftp_links, on='Run', how='left')
+        logging.info(f"Total rows after merging: {len(merged_info)}")
+        
+        # Log information about any runs that didn't get FTP links
+        missing_ftp = merged_info[merged_info['submitted_ftp'].isnull()]
+        if not missing_ftp.empty:
+            logging.warning(f"Runs missing FTP links: {missing_ftp['Run'].tolist()}")
 
-        # Process each run
-        for _, run_info in merged_info.iterrows():
-            process_run(run_info)
+        # Add counter for processed samples
+        processed_count = 0
+        
+        # Process each run with additional logging
+        for idx, run_info in merged_info.iterrows():
+            try:
+                logging.info(f"Starting to process run {idx + 1} of {len(merged_info)}: {run_info['Run']}")
+                
+                if pd.isnull(run_info['submitted_ftp']):
+                    logging.error(f"Skipping {run_info['Run']} due to missing FTP link")
+                    continue
+                    
+                if pd.isnull(run_info['Assay']):
+                    logging.error(f"Skipping {run_info['Run']} due to missing Assay information")
+                    continue
+
+                process_run(run_info)
+                processed_count += 1
+                logging.info(f"Successfully processed {processed_count} samples so far")
+                
+            except Exception as e:
+                logging.error(f"Error processing run {run_info['Run']}: {str(e)}")
+                continue
+
+        logging.info(f"Processing completed. Total samples processed: {processed_count}")
+
     except Exception as e:
         logging.error(f"An error occurred in the main processing loop: {e}")
+        raise
+def process_run(run_info):
+    run_accession = run_info['Run']
+    logging.info(f"Processing run: {run_accession}")
+
+    # Set up logging for this run
+    run_logger = setup_run_logger(run_accession)
+
+    try:
+        # Define expected STAR output file path
+        star_output_dir = MAPPED_DIR / run_accession / "outputSolo.out" / "GeneFull" / "raw"
+        expected_star_file = os.path.join(star_output_dir, "barcodes.tsv")
+
+        if os.path.exists(expected_star_file):
+            logging.info(f"STAR output file found for {run_accession}, skipping download and mapping.")
+        else:
+            # Check if assay type is supported
+            assay = run_info['Assay']
+            if assay not in ASSAY_PARAMS:
+                logging.error(f"Unsupported assay type for {run_accession}: {assay}")
+                return
+
+            # Download FASTQ files
+            download_fastqs(run_accession, run_info['submitted_ftp'])
+
+            # Map with STAR
+            if run_star(run_accession, assay):
+                logging.info(f"STAR mapping completed for {run_accession}")
+            else:
+                logging.error(f"STAR mapping failed for {run_accession}")
+                return
+
+        # Convert to H5AD if STAR output exists
+        if convert_star_to_h5ad(run_accession):
+            logging.info(f"H5AD conversion completed for {run_accession}")
+        else:
+            logging.error(f"H5AD conversion failed for {run_accession}")
+
+    except Exception as e:
+        logging.error(f"Error in process_run for {run_accession}: {str(e)}")
+        raise
 
 if __name__ == "__main__":
     main()
