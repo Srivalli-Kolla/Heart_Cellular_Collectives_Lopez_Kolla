@@ -1,4 +1,5 @@
 import subprocess
+import glob
 import pandas as pd
 import os
 import anndata
@@ -17,8 +18,8 @@ WHITELIST_DIR = BASE_DIR / "sc-heart-consortium/ncbi-sra/whitelist_files"
 
 STAR_PATH = "/usr/local/bin/STAR"
 STAR_INDEX = BASE_DIR / "dmd_dc_skeletal/index_files/human/"
-METADATA_FILE = BASE_DIR / "Github/Heart_Cellular_Collectives_Lopez_Kolla/ncbi_sra/data/Data-Litnukova_Kanemaru.tsv"
-FTP_LINKS_FILE = BASE_DIR / "Github/Heart_Cellular_Collectives_Lopez_Kolla/ncbi_sra/data/Data-Litnukova_Kanemaru-links.tsv"
+METADATA_FILE = BASE_DIR / "Github/Heart_Cellular_Collectives_Lopez_Kolla/ncbi_sra/data/Data-D3_litnukova.tsv"
+FTP_LINKS_FILE = BASE_DIR / "Github/Heart_Cellular_Collectives_Lopez_Kolla/ncbi_sra/data/Data-D3_litnukova-links.tsv"
 
 # Define whitelist mapping for assay types
 WHITELIST_MAPPING = {
@@ -43,41 +44,50 @@ ASSAY_PARAMS = {
 }
 
 # Configure logging
-LOG_FILE = LOG_DIR / "Data-Litnukova_Kanemaru.log"
+LOG_FILE = LOG_DIR / "Data-D3_litnukova.log"
 logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Function to download fastqs
-def download_fastq(run_id, ftp_links):
-    """Download FASTQ files using axel."""
+# Function to download FASTQ files
+def download_fastqs(run_id, ftp_links):
     output_dir = DOWNLOAD_DIR / run_id
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     for link in ftp_links.split(';'):
+        link = link.strip()  # Clean any extra whitespace
         try:
             logging.info(f"Downloading {link} for {run_id}...")
-            axel_command = ['axel', '-n', '8', '-o', str(output_dir), link]
+            output_file = output_dir / Path(link).name
+            
+            # Use axel to download with multiple connections
+            axel_command = ['axel', '-n', '8', '-o', str(output_file), link]
             subprocess.run(axel_command, check=True)
             logging.info(f"Successfully downloaded {link} for {run_id}.")
         except subprocess.CalledProcessError as e:
-            logging.error(f"Failed to download {link} for {run_id}: {e}")
+            logging.error(f"Failed to download {link} for {run_id}: {e}. Retrying...")
+            try:
+                subprocess.run(axel_command, check=True)
+                logging.info(f"Successfully downloaded {link} for {run_id} on retry.")
+            except subprocess.CalledProcessError as retry_e:
+                logging.error(f"Retry failed for {link} for {run_id}: {retry_e}")
+        except Exception as general_e:
+            logging.error(f"An unexpected error occurred for {link} for {run_id}: {general_e}")
 
-# Function to run STAR alignmnet
+# Function to run STAR mapping
 def run_star(run_id, assay):
-    """Run STAR for mapping based on the assay type."""
     fastq_dir = DOWNLOAD_DIR / run_id
-    fastq_files = sorted([f for f in fastq_dir.glob("*.fastq.gz")])
+    fastq_files = sorted(fastq_dir.glob("*.fastq.gz"))
 
     fastq_files_r1 = [file for file in fastq_files if "_R1_" in file.name]
     fastq_files_r2 = [file for file in fastq_files if "_R2_" in file.name]
 
     if not fastq_files_r1 or not fastq_files_r2:
         logging.error(f"FASTQ files missing for {run_id}.")
-        return  
+        return False
 
     assay_params = ASSAY_PARAMS.get(assay)
     if not assay_params:
         logging.error(f"No STAR parameters available for assay {assay}")
-        return
+        return False
 
     output_dir = MAPPED_DIR / run_id / "output"
     output_dir.mkdir(parents=True, exist_ok=True)  
@@ -85,7 +95,7 @@ def run_star(run_id, assay):
     whitelist_filename = WHITELIST_MAPPING.get(assay)
     if not whitelist_filename:
         logging.error(f"No whitelist file found for assay type {assay}")
-        return
+        return False
 
     star_command = [
         STAR_PATH, "--runThreadN", "32",
@@ -107,137 +117,91 @@ def run_star(run_id, assay):
     try:
         subprocess.run(star_command, check=True)
         logging.info(f"STAR mapping completed for {run_id}.")
+        return True
     except subprocess.CalledProcessError as e:
         logging.error(f"STAR mapping failed for {run_id} with error: {e}")
-
-# Function to convert STAR outout to h5ad
-def convert_to_h5ad(run_id):
-    """Convert STAR output to H5AD format."""
+        return False
     
-    matrix_dir = MAPPED_DIR / run_id / "outputSolo.out" / "GeneFull" / "raw"
-    logging.info(f"Checking matrix directory: {matrix_dir}")
-    
-    if not matrix_dir.exists():
-        logging.error(f"Matrix directory does not exist for {run_id}: {matrix_dir}")
-        return
+# Function to convert STAR output to H5AD
+def convert_star_to_h5ad(run_accession):
+    output_dir = MAPPED_DIR / run_accession / "outputSolo.out" / "GeneFull" / "raw"
+    barcodes_file = output_dir / "barcodes.tsv"
+    features_file = output_dir / "features.tsv"
+    matrix_file = output_dir / "matrix.mtx"
+    h5ad_file = H5AD_DIR / f"{run_accession}.h5ad"
 
-    matrix_file = matrix_dir / "matrix.mtx"
-    barcodes_file = matrix_dir / "barcodes.tsv"
-    features_file = matrix_dir / "features.tsv"
+    if not all(os.path.exists(f) for f in [barcodes_file, features_file, matrix_file]):
+        logging.error(f"Required files are missing for {run_accession}. Skipping conversion.")
+        return False
 
-    if not matrix_file.exists():
-        logging.error(f"Matrix file missing for {run_id}: {matrix_file}")
-        return
-    if not barcodes_file.exists():
-        logging.error(f"Barcodes file missing for {run_id}: {barcodes_file}")
-        return
-    if not features_file.exists():
-        logging.error(f"Features file missing for {run_id}: {features_file}")
-        return
+    # Remove existing H5AD file to allow overwriting
+    if os.path.exists(h5ad_file):
+        os.remove(h5ad_file)
 
     try:
-       
-        mtx = scipy.io.mmread(matrix_file).tocsc()
+        logging.info(f"Converting STAR output to H5AD for {run_accession}...")
+        barcodes = pd.read_csv(barcodes_file, header=None)
+        features = pd.read_csv(features_file, header=None, sep='\t', names=['gene_id', 'gene_name'])
+        matrix = scipy.io.mmread(matrix_file).tocsr()
 
-       
-        barcodes = pd.read_csv(barcodes_file, header=None, sep="\t")[0].values
-        features = pd.read_csv(features_file, header=None, sep="\t")[1].values
+        adata = anndata.AnnData(X=matrix.T, obs=pd.DataFrame(index=barcodes[0]), var=features.set_index('gene_id'))
+        adata.write(h5ad_file)
+        logging.info(f"Successfully converted to H5AD: {h5ad_file}")
 
-        if mtx.shape[0] != len(features) or mtx.shape[1] != len(barcodes):
-            logging.error(f"Matrix dimensions {mtx.shape} do not match the lengths of barcodes {len(barcodes)} or features {len(features)}.")
-            return
+        return True
+    except Exception as e:
+        logging.error(f"Error converting STAR output to H5AD for {run_accession}: {e}")
+        return False
 
+# Function to configure a run-specific logger
+def setup_run_logger(run_accession):
+    run_log_file = LOG_DIR / f"{run_accession}.log"
+    run_logger = logging.getLogger(run_accession)
+    run_logger.setLevel(logging.INFO)
     
-        adata = anndata.AnnData(X=mtx, obs=pd.DataFrame(index=barcodes), var=pd.DataFrame(index=features))
+    # Create file handler for run-specific log file
+    file_handler = logging.FileHandler(run_log_file)
+    file_handler.setLevel(logging.INFO)
+    
+    # Create formatter and add it to the handler
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(formatter)
+    
+    # Add the file handler to the logger
+    run_logger.addHandler(file_handler)
+    
+    return run_logger
 
-        
-        output_path = H5AD_DIR / f"{run_id}.h5ad"
+def process_run(run_info):
+    run_accession = run_info['Run']
+    logging.info(f"Processing run: {run_accession}")
 
-        
-        adata.write(output_path)
-        logging.info(f"Converted STAR output to H5AD format for {run_id} at {output_path}")
-    except Exception as e:
-        logging.error(f"Failed to convert to H5AD for {run_id} with error: {e}")
+    # Set up logging for this run
+    run_logger = setup_run_logger(run_accession)
 
-# Function to run all necessary steps
-def process_run(run_id, assay, ftp_links):
-    try:
-        # Define paths
-        h5ad_path = H5AD_DIR / f"{run_id}.h5ad"
-        matrix_dir = MAPPED_DIR / run_id / "outputSolo.out" / "GeneFull" / "raw"
-        fastq_dir = DOWNLOAD_DIR / run_id
-        
-        # Check if STAR output exists and convert to H5AD if found
-        if matrix_dir.exists():
-            logging.info(f"STAR output found for {run_id}. Converting to H5AD.")
-            convert_to_h5ad(run_id)
-            return
-        
-        # Check for existing FASTQ files
-        fastq_files_r1 = list(fastq_dir.glob("*_R1_*.fastq.gz"))
-        fastq_files_r2 = list(fastq_dir.glob("*_R2_*.fastq.gz"))
+    # Download FASTQ files
+    download_fastqs(run_accession, run_info['submitted_ftp'])
 
-        if fastq_files_r1 and fastq_files_r2:
-            logging.info(f"FASTQ files found for {run_id}. Running STAR alignment.")
-            run_star(run_id, assay)
+    # Map with STAR
+    assay = run_info['Assay']
+    if run_star(run_accession, assay):
+        # Convert to H5AD if STAR mapping was successful
+        convert_star_to_h5ad(run_accession)
 
-            # Ensure STAR alignment was successful
-            if matrix_dir.exists():  # Only convert if STAR has generated output
-                convert_to_h5ad(run_id)
-            else:
-                logging.error(f"STAR output was not generated for {run_id} after alignment.")
-            return
-
-        # If no files are found, download FASTQ files
-        logging.info(f"No files found for {run_id}. Downloading FASTQ files.")
-        download_fastq(run_id, ftp_links)
-        
-        # Run STAR and convert to H5AD after downloading
-        run_star(run_id, assay)
-
-        # Check STAR output again after attempting to run
-        if matrix_dir.exists():
-            convert_to_h5ad(run_id)
-        else:
-            logging.error(f"STAR output was not generated for {run_id} after alignment.")
-
-    except Exception as e:
-        logging.error(f"Error processing {run_id} during conversion: {e}")
-
-# Function to perform tasks
 def main():
-    
-    MAPPED_DIR.mkdir(parents=True, exist_ok=True)
-    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    H5AD_DIR.mkdir(parents=True, exist_ok=True)
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        # Read metadata and submitted_ftp
+        metadata = pd.read_csv(METADATA_FILE, sep="\t")
+        ftp_links = pd.read_csv(FTP_LINKS_FILE, sep="\t")
 
-    
-    metadata = pd.read_csv(METADATA_FILE, sep="\t")
-    ftp_links = pd.read_csv(FTP_LINKS_FILE, sep="\t")
+        # Merge metadata with submitted_ftp on run accession
+        merged_info = pd.merge(metadata, ftp_links, on='Run', how='left')
 
-    
-    ftp_links_dict = ftp_links.set_index('Run')['submitted_ftp'].to_dict()
-
-    
-    for run_id in metadata['Run'].unique():
-        try:
-            
-            assay = metadata.loc[metadata['Run'] == run_id, 'Assay'].values[0]
-
-            
-            ftp_links_for_run = ftp_links_dict.get(run_id)
-            if not ftp_links_for_run:
-                logging.warning(f"No FTP links found for run ID {run_id}. Skipping.")
-                continue
-
-            # Process the current run
-            logging.info(f"Starting process for run ID {run_id}, assay {assay}.")
-            process_run(run_id, assay, ftp_links_for_run)
-            logging.info(f"Completed process for run ID {run_id}.")
-
-        except Exception as e:
-            logging.error(f"Error processing run ID {run_id}: {e}")
+        # Process each run
+        for _, run_info in merged_info.iterrows():
+            process_run(run_info)
+    except Exception as e:
+        logging.error(f"An error occurred in the main processing loop: {e}")
 
 if __name__ == "__main__":
     main()
