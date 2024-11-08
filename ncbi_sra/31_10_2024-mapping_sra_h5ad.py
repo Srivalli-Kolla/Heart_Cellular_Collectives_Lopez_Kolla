@@ -1,4 +1,5 @@
 import subprocess
+import concurrent.futures
 import glob
 import pandas as pd
 import os
@@ -8,6 +9,9 @@ import numpy as np
 from pathlib import Path
 import logging
 import signal
+import time
+
+timestamp = time.strftime("%d_%m_%Y,%H:%M")
 
 # Define paths
 BASE_DIR = Path("/mnt/LaCIE/skolla")
@@ -19,11 +23,11 @@ WHITELIST_DIR = BASE_DIR / "sc-heart-consortium/ncbi-sra/whitelist_files"
 
 STAR_PATH = "/usr/local/bin/STAR"
 STAR_INDEX = BASE_DIR / "dmd_dc_skeletal/index_files/human/"
-METADATA_FILE = BASE_DIR / "Github/Heart_Cellular_Collectives_Lopez_Kolla/ncbi_sra/data/Data-D3_litnukova.tsv"
-FTP_LINKS_FILE = BASE_DIR / "Github/Heart_Cellular_Collectives_Lopez_Kolla/ncbi_sra/data/Data-D3_litnukova-links.tsv"
+METADATA_FILE = BASE_DIR / "Github/Heart_Cellular_Collectives_Lopez_Kolla/ncbi_sra/data/Data-Litnukova_Kanemaru_missing.tsv"
+FTP_LINKS_FILE = BASE_DIR / "Github/Heart_Cellular_Collectives_Lopez_Kolla/ncbi_sra/data/Data-Litnukova_Kanemaru-links.tsv"
 
 # Configure logging
-LOG_FILE = LOG_DIR / "Data-D3_litnukova.log"
+LOG_FILE = LOG_DIR / "Data-Litnukova_Kanemaru_without_parallel_process.log"
 logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 
@@ -82,7 +86,7 @@ def download_fastqs(run_id, ftp_links):
                 continue
                 
             # Try axel first
-            axel_command = ['axel', '-n', '8', '-o', str(output_file), link]
+            axel_command = ['axel', '-n', '12', '-o', str(output_file), link]
             axel_result = safe_subprocess(axel_command, f"Downloading with axel: {link}")
             
             # If axel fails, try wget as fallback
@@ -121,7 +125,7 @@ def run_star(run_id, assay):
     whitelist_filename = WHITELIST_MAPPING.get(assay)
 
     star_command = [
-        STAR_PATH, "--runThreadN", "32",
+        STAR_PATH, "--runThreadN", "48",
         "--genomeDir", str(STAR_INDEX),
         "--readFilesIn", str(fastq_files_r2[0]), str(fastq_files_r1[0]),
         "--runDirPerm", "All_RWX",
@@ -136,9 +140,35 @@ def run_star(run_id, assay):
         "--readFilesCommand", "zcat",
         "--outFileNamePrefix", str(output_dir / "")
     ]
+    
+    # Run STAR mapping
+    if safe_subprocess(star_command, f"Running STAR mapping for {run_id}"):
 
+        expected_output = MAPPED_DIR / run_id / "outputSolo.out" / "GeneFull" / "raw" / "barcodes.tsv"
+        
+        if expected_output.exists():
+            logging.info(f"STAR output found. Deleting FASTQ files for {run_id}...")
+            for fastq_file in fastq_dir.glob("*.fastq.gz"):
+                try:
+                    fastq_file.unlink()
+                    logging.info(f"Deleted {fastq_file}")
+                except Exception as delete_error:
+                    logging.error(f"Could not delete {fastq_file}: {delete_error}")
 
-    return bool(safe_subprocess(star_command, f"Running STAR mapping for {run_id}"))
+                            # Delete .sam files
+            for sam_file in (MAPPED_DIR / run_id).glob("*.sam"):
+                try:
+                    sam_file.unlink()
+                    logging.info(f"Deleted {sam_file}")
+                except Exception as delete_error:
+                    logging.error(f"Could not delete {sam_file}: {delete_error}")
+        else:
+            logging.warning(f"Expected STAR output not found for {run_id} at {expected_output}. Retaining FASTQ files.")
+        
+        return True
+    else:
+        logging.error(f"STAR mapping failed for {run_id}. Retaining FASTQ files.")
+        return False
     
 # Function to convert STAR output to H5AD
 def convert_star_to_h5ad(run_accession):
@@ -146,29 +176,56 @@ def convert_star_to_h5ad(run_accession):
     barcodes_file = output_dir / "barcodes.tsv"
     features_file = output_dir / "features.tsv"
     matrix_file = output_dir / "matrix.mtx"
-    h5ad_file = H5AD_DIR / f"{run_accession}.h5ad"
+    h5ad_file = H5AD_DIR / f"{run_accession}_GeneFull_{timestamp}.h5ad"
+    fastq_dir = DOWNLOAD_DIR / run_accession  
 
+    # Check if all required files exist
     if not all(os.path.exists(f) for f in [barcodes_file, features_file, matrix_file]):
         logging.error(f"Required files are missing for {run_accession}. Skipping conversion.")
         return False
 
-    # Remove existing H5AD file to allow overwriting
+    # Remove existing H5AD file if it exists
     if os.path.exists(h5ad_file):
         os.remove(h5ad_file)
 
     try:
         logging.info(f"Converting STAR output to H5AD for {run_accession}...")
-        barcodes = pd.read_csv(barcodes_file, header=None, index_col= 0)
-        features = pd.read_csv(features_file, sep='\t', names=['gene_ids', 'gene_names', 'gene_types'], index_col=1)
-        matrix = scipy.sparse.csr_matrix(scipy.io.mmread( matrix_file).T)
 
+        # Read and preprocess barcodes
+        barcodes = pd.read_csv(barcodes_file, header=None, index_col=0)
+        barcodes.index = barcodes.index.astype(str)
+        barcodes.index.name = None
+
+        # Read and preprocess features
+        features = pd.read_csv(features_file, sep='\t', names=['gene_ids', 'gene_names', 'gene_types'], index_col=1)
+        features.index = features.index.astype(str)
+        features.index.name = None
+        features.columns = features.columns.astype(str)
+
+        # Load the matrix file and ensure it’s a sparse CSR matrix
+        matrix = scipy.io.mmread(matrix_file)
+        if not isinstance(matrix, scipy.sparse.csr_matrix):
+            matrix = scipy.sparse.csr_matrix(matrix.T)  # Transpose and convert to CSR for AnnData compatibility
+
+        # Verify matrix dimensions match barcodes and features
+        if matrix.shape[0] != len(barcodes) or matrix.shape[1] != len(features):
+            logging.error(f"Dimension mismatch: Matrix shape {matrix.shape}, Barcodes {len(barcodes)}, Features {len(features)}")
+            return False
+
+        # Create AnnData object, checking for correct data types and structure
         adata = anndata.AnnData(X=matrix, obs=barcodes, var=features)
+        adata.layers['spliced'] = matrix
+        adata.var_names_make_unique()
+
+       # Create AnnData object 
         adata.write(h5ad_file)
         logging.info(f"Successfully converted to H5AD: {h5ad_file}")
 
         return True
     except Exception as e:
         logging.error(f"Error converting STAR output to H5AD for {run_accession}: {e}")
+        if hasattr(e, 'args') and e.args:
+            logging.error(f"Details: {e.args[0]}")
         return False
 
 # Function to configure a run-specific logger
@@ -198,8 +255,8 @@ def process_run(run_info):
     run_logger = setup_run_logger(run_accession)
 
     # Define expected STAR output file path
-    star_output_dir = MAPPED_DIR / run_accession / "outputSolo.out" / "GeneFull" / "raw"
-    expected_star_file = os.path.join(star_output_dir, "barcodes.tsv") 
+    star_output_dir = MAPPED_DIR / run_accession
+    expected_star_file = os.path.join(star_output_dir, "outputLog.final.out") 
 
     if os.path.exists(expected_star_file):
         logging.info(f"STAR output file found for {run_accession}, skipping download and mapping.")
@@ -214,61 +271,10 @@ def process_run(run_info):
         else:
             logging.warning(f"STAR mapping failed for {run_accession}")
         
-    # Convert to H5AD if STAR output exists (or was successfully created)
+    # Convert to H5AD if STAR output exists 
     convert_star_to_h5ad(run_accession)
 
-def main():
-    try:
-        # Read metadata and submitted_ftp
-        metadata = pd.read_csv(METADATA_FILE, sep="\t")
-        ftp_links = pd.read_csv(FTP_LINKS_FILE, sep="\t")
-        
-        # Add diagnostic logging for input data
-        logging.info(f"Total rows in metadata: {len(metadata)}")
-        logging.info(f"Total rows in ftp_links: {len(ftp_links)}")
-        
-        # Check for any missing or null values in key columns
-        logging.info(f"Null values in metadata 'Run' column: {metadata['Run'].isnull().sum()}")
-        logging.info(f"Null values in ftp_links 'Run' column: {ftp_links['Run'].isnull().sum()}")
-
-        # Merge metadata with submitted_ftp on run accession
-        merged_info = pd.merge(metadata, ftp_links, on='Run', how='left')
-        logging.info(f"Total rows after merging: {len(merged_info)}")
-        
-        # Log information about any runs that didn't get FTP links
-        missing_ftp = merged_info[merged_info['submitted_ftp'].isnull()]
-        if not missing_ftp.empty:
-            logging.warning(f"Runs missing FTP links: {missing_ftp['Run'].tolist()}")
-
-        # Add counter for processed samples
-        processed_count = 0
-        
-        # Process each run with additional logging
-        for idx, run_info in merged_info.iterrows():
-            try:
-                logging.info(f"Starting to process run {idx + 1} of {len(merged_info)}: {run_info['Run']}")
-                
-                if pd.isnull(run_info['submitted_ftp']):
-                    logging.error(f"Skipping {run_info['Run']} due to missing FTP link")
-                    continue
-                    
-                if pd.isnull(run_info['Assay']):
-                    logging.error(f"Skipping {run_info['Run']} due to missing Assay information")
-                    continue
-
-                process_run(run_info)
-                processed_count += 1
-                logging.info(f"Successfully processed {processed_count} samples so far")
-                
-            except Exception as e:
-                logging.error(f"Error processing run {run_info['Run']}: {str(e)}")
-                continue
-
-        logging.info(f"Processing completed. Total samples processed: {processed_count}")
-
-    except Exception as e:
-        logging.error(f"An error occurred in the main processing loop: {e}")
-        raise
+# Function to run processes in an order
 def process_run(run_info):
     run_accession = run_info['Run']
     logging.info(f"Processing run: {run_accession}")
@@ -308,6 +314,60 @@ def process_run(run_info):
 
     except Exception as e:
         logging.error(f"Error in process_run for {run_accession}: {str(e)}")
+        raise
+
+
+def main():
+    try:
+        # Read metadata and submitted_ftp
+        metadata = pd.read_csv(METADATA_FILE, sep="\t")
+        ftp_links = pd.read_csv(FTP_LINKS_FILE, sep="\t")
+        
+        # Diagnostic logging for input data
+        logging.info(f"Total rows in metadata: {len(metadata)}")
+        logging.info(f"Total rows in ftp_links: {len(ftp_links)}")
+        
+        # Check for any missing or null values in key columns
+        logging.info(f"Null values in metadata 'Run' column: {metadata['Run'].isnull().sum()}")
+        logging.info(f"Null values in ftp_links 'Run' column: {ftp_links['Run'].isnull().sum()}")
+
+        # Merge metadata with submitted_ftp on run accession
+        merged_info = pd.merge(metadata, ftp_links, on='Run', how='left')
+        logging.info(f"Total rows after merging: {len(merged_info)}")
+        
+        # Log information about any runs that didn't get FTP links
+        missing_ftp = merged_info[merged_info['submitted_ftp'].isnull()]
+        if not missing_ftp.empty:
+            logging.warning(f"Runs missing FTP links: {missing_ftp['Run'].tolist()}")
+
+        # Counter for processed samples
+        processed_count = 0
+
+        # Sequential processing of each run
+        for idx, run_info in merged_info.iterrows():
+            try:
+                logging.info(f"Starting to process run {idx + 1} of {len(merged_info)}: {run_info['Run']}")
+                
+                if pd.isnull(run_info['submitted_ftp']):
+                    logging.error(f"Skipping {run_info['Run']} due to missing FTP link")
+                    continue
+                
+                if pd.isnull(run_info['Assay']):
+                    logging.error(f"Skipping {run_info['Run']} due to missing Assay information")
+                    continue
+
+                # Process the run
+                process_run(run_info)
+                processed_count += 1
+                logging.info(f"Successfully processed {processed_count} samples so far")
+
+            except Exception as e:
+                logging.error(f"Error processing run {run_info['Run']}: {e}")
+
+        logging.info(f"Processing completed. Total samples processed: {processed_count}")
+
+    except Exception as e:
+        logging.error(f"An error occurred in the main processing loop: {e}")
         raise
 
 if __name__ == "__main__":
